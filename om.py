@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import curses, html, json, locale, os, platform, plistlib, random, re, shutil, signal, subprocess, sys, textwrap, threading, time
+import curses, html, json, locale, os, platform, plistlib, random, re, shutil, signal, subprocess, sys, textwrap, threading, time, uuid
 import urllib.error, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +24,12 @@ OM_SETTINGS = CONFIG / "om_settings.json"
 LAUNCH_AGENTS = Path.home() / "Library/LaunchAgents"
 CLAUDE_TOKEN = "ollama"
 CLAUDE_TIERS = ("OPUS", "SONNET", "HAIKU")
+CLAUDE_SESSION_FLAGS = {"-r", "--resume", "-c", "--continue", "--session-id", "-p", "--print"}
 MACOS_GPU_SHARE = 0.75
+CONTROL_SCHEMES = ["classic", "vim"]
 OM_OPTIONS = {
+    "controls": (CONTROL_SCHEMES, "classic: single-letter keys and two-number page jumps. vim: counts, gg / G, "
+                 "ctrl-d / ctrl-u, h / l between pages, and : commands with fuzzy search; the logo shows what you type"),
     "screensaver": (screensavers.SCENES + ["random"], "what z shows: warp-speed stars, a rainy day, growing pipes, "
                     "or a muncher eating its way through the bytes. Each one speeds up with the download"),
     "progress style": (screensavers.PROGRESS_STYLES, "how the screensaver shows the percentage: big blocks, "
@@ -37,6 +41,11 @@ OM_TEXT_SETTINGS = {"backup folder": "~/Documents"}
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "om"
 DOWNLOADS = STATE / "downloads"
 CHATS = STATE / "chats"
+CC_SESSIONS = STATE / "cc"
+CLAUDE_PROJECTS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+NVIM_HISTORY = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "nvim/codecompanion-history/index.json"
+CHAT_FOLDERS = [("cc", "Claude Code sessions started from om"), ("nvim", "codecompanion chats from nvim"),
+                ("chats", "ollama-local chats in om")]
 CLAUDE_BACKUP = SUITE / "claude-backup"
 CLAUDE_PROMPT = Path.home() / ".claude" / "CLAUDE.md"
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -62,7 +71,7 @@ FOOTER = {
     "ollama": [("⏎", "edit"), ("a", "apply & restart ollama"), ("r", "reload"), ("h", "help"), ("q", "quit")],
     "configs": [("⏎", "change"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
     "files": [("⏎", "open"), ("f", "show in Finder"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
-    "chats": [("⏎", "open"), ("d", "delete"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
+    "chats": [("⏎", "open / fold"), ("d", "delete"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
     "backups": [("⏎", "back up / restore"), ("b", "back up everything"), ("f", "show in Finder"), ("r", "refresh"),
                 ("h", "help"), ("q", "quit")],
     "system": [("⏎", "change"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
@@ -86,18 +95,31 @@ HELP = {
     "configs": [("⏎", "change the selected config: nvim's model, om claude's base model, its context size, "
                       "or the backup folder"),
                 ("r", "re-read the configs")],
-    "chats": [("⏎", "reopen the selected ollama-local chat"), ("d", "delete it"), ("r", "refresh")],
+    "chats": [("⏎", "open or close a folder; open a chat: cc resumes Claude Code, nvim opens it in nvim, chats in om"),
+              ("d", "delete an om chat, or remove a cc session from om (Claude keeps its transcript)"), ("r", "refresh")],
     "backups": [("⏎", "run the selected backup, or restore the selected archive (adds what's missing, never overwrites)"),
                 ("b", "back up claude-local and ollama-local now"), ("f", "show the archive in Finder"), ("r", "refresh")],
     "files": [("⏎", "open the file in $EDITOR, the log in less, or the folder in Finder"), ("f", "show it in Finder"),
               ("r", "refresh sizes")],
     "system": [("⏎", "change the GPU memory limit"), ("r", "refresh")],
     "om": [("⏎  space", "switch the selected setting to its next choice (saved right away)")],
-    "every page": [("↑ ↓  j k  g G", "move the selection"), ("1  2  3", "switch group: ollama, local, om"),
+    "every page": [(":", "command line: type to fuzzy search every command, tab completes, ⏎ runs"),
+                   ("↑ ↓  j k  g G", "move the selection"), ("1  2  3", "switch group: ollama, local, om"),
                    ("two numbers", "jump to a page: 1 1 llms, 1 2 market, 2 2 files…; the group blinks until the second, 0 goes back"),
                    ("tab  shift+tab", "next / previous page"), ("m  esc", "market / back to your llms"), ("z", "screensaver: watch the downloads (any key returns)"),
                    ("h  ?", "show this help"), ("q  ctrl+c", "quit; downloads keep going and om picks them up next time")],
 }
+HELP_VIM = [("j k  ↑ ↓", "move; a count repeats it (5j)"), ("gg  G", "first / last row; 12gg or 12G goes to row 12"),
+            ("ctrl-d  ctrl-u", "half a page down / up"), ("h l  ← →", "previous / next page"),
+            ("⏎  space  o  x  /", "open, load, chat, pause a download, search: same as classic"),
+            (":", "command line: type to fuzzy search, tab completes, ⏎ runs, esc cancels"),
+            ("?", "this help"), ("z", "screensaver"), ("esc", "clear a half-typed count or g"), (":q  ctrl+c", "quit")]
+FOOTER_VIM = [("j k", "move"), ("gg G", "top / bottom"), ("h l", "page"), ("⏎", "open"), ("o", "chat"), (":", "commands"),
+              (":claude", "Claude Code"), ("/", "search"), ("?", "help"), (":q", "quit")]
+FOOTER_PALETTE = [("⏎", "run"), ("tab", "complete"), ("↑ ↓", "pick"), ("esc", "cancel")]
+VIM_PASSTHROUGH = (*ENTER, ord(" "), ord("o"), ord("x"), ord("/"))
+CTRL_D, CTRL_U = 4, 21
+PALETTE_ROWS = 8
 C = {}
 
 
@@ -110,6 +132,11 @@ def api(path, body=None, method=None, stream=False, timeout=5):
 
 def fetch(url, **headers):
     return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "om", **headers}), timeout=15).read().decode()
+
+
+def ollama_timed_out(error):
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, TimeoutError) or "timed out" in str(reason)
 
 
 def err_text(e):
@@ -206,6 +233,16 @@ def modelfile_field_write(pattern, line):
     config_write(MODELFILE, text)
 
 
+def model_details(name):
+    try:
+        s = api("/api/show", {"model": name})
+    except OSError:
+        return {}
+    ctx = next((v for k, v in s.get("model_info", {}).items() if k.endswith(".context_length")), None)
+    num = re.search(r"num_ctx\s+(\d+)", s.get("parameters") or "")
+    return dict(ctx=ctx, num_ctx=num and int(num.group(1)), caps=s.get("capabilities", []))
+
+
 def modelfile_rebuild():
     if not base():
         raise RuntimeError(f"pick a base model for {CUSTOM} first: om use <model>")
@@ -247,7 +284,7 @@ def backup_folder():
 
 
 def ollama_local_sources():
-    return {"chats": CHATS, "config": CONFIG}
+    return {"chats": CHATS, "cc": CC_SESSIONS, "config": CONFIG, "nvim-chats": NVIM_HISTORY.parent}
 
 
 def backup_everything():
@@ -555,6 +592,40 @@ def setup_colors():
         C[k] = curses.color_pair(i)
 
 
+def fuzzy_score(query, text):
+    position, score = -1, 0
+    for letter in query.lower():
+        found = text.lower().find(letter, position + 1)
+        if found < 0:
+            return None
+        score, position = score + found - position - 1, found
+    return score
+
+
+def page_label(page):
+    group = page_group(page)
+    pages = GROUPS[group][1]
+    number = [p for _, p in pages].index(page)
+    return f"{group + 1} {number + 1} {pages[number][0]}"
+
+
+def palette_parse(typed):
+    first, _, rest = typed.partition(" ")
+    if first in [name for name, _ in GROUPS] and rest:
+        word, _, arg = rest.partition(" ")
+        return f"{first} {word}", arg.strip()
+    return first, rest.strip()
+
+
+def command_matches(commands, query):
+    def score(command):
+        alone = fuzzy_score(query, command["name"])
+        grouped = fuzzy_score(query, f"{command['group']} {command['name']}")
+        return alone if alone is not None else None if grouped is None else grouped + len(command["group"])
+    scored = [(score(command), len(command["name"]), i, command) for i, command in enumerate(commands)]
+    return [command for value, _, _, command in sorted((item for item in scored if item[0] is not None), key=lambda item: item[:3])]
+
+
 def selection_move(k, sel, count):
     step = {curses.KEY_DOWN: 1, ord("j"): 1, curses.KEY_UP: -1, ord("k"): -1, curses.KEY_NPAGE: 10,
             curses.KEY_PPAGE: -10, ord("g"): -10 ** 9, ord("G"): 10 ** 9}.get(k)
@@ -573,26 +644,46 @@ class App:
         self.settings_options = None
         self.budget, self.body_h = gpu_budget(), 0
         self.newest_rank, self.remote = {}, {}
-        self.downloads = {}
+        self.downloads, self.loading, self.refreshing, self.ollama_busy = {}, {}, False, False
+        self.palette, self.palette_sel, self.pending = None, 0, ""
+        self.chat_folders_open = {folder: True for folder, _ in CHAT_FOLDERS}
         self.load_library()
 
     # ---- data -------------------------------------------------------------
+    def refresh_start(self):
+        if self.refreshing:
+            return
+        self.refreshing, self.last = True, time.time()
+        threading.Thread(target=self.refresh_worker, daemon=True).start()
+
+    def refresh_worker(self):
+        try:
+            self.refresh()
+        finally:
+            self.refreshing = False
+
     def refresh(self):
         try:
-            self.models = sorted(api("/api/tags")["models"], key=lambda m: (not is_custom(m["name"]), m["name"]))
-            self.loaded = {m["name"]: m for m in api("/api/ps")["models"]}
-            self.version, self.down = api("/api/version")["version"], False
-        except OSError:
-            self.models, self.loaded, self.down = [], {}, True
+            version = api("/api/version")["version"]
+            models = sorted(api("/api/tags")["models"], key=lambda m: (not is_custom(m["name"]), m["name"]))
+            loaded = {m["name"]: m for m in api("/api/ps")["models"]}
+            down = False
+        except OSError as e:
+            if ollama_timed_out(e):
+                self.ollama_busy, self.last = True, time.time()
+                return
+            models, loaded, version, down = [], {}, self.version, True
+        self.ollama_busy = False
         # while ollama is down nothing looks installed, so don't offer every model as saved-only
-        saved = [] if self.down else sorted(self.model_library_sync())
-        self.entries = self.models + [dict(name=name, **(self.remote.get(name) or {})) for name in saved]
+        saved = [] if down else sorted(self.model_library_sync(models))
+        entries = models + [dict(name=name, **(self.remote.get(name) or {})) for name in saved]
+        self.models, self.loaded, self.version, self.down, self.entries = models, loaded, version, down, entries
         self.registry_stats_load([name for name in saved if name not in self.remote])
-        self.sel["models"] = max(0, min(self.sel["models"], len(self.entries) - 1))
+        self.sel["models"] = max(0, min(self.sel["models"], len(entries) - 1))
         self.last = time.time()
 
-    def model_library_sync(self):
-        library, installed = model_library_read(), [m["name"] for m in self.models]
+    def model_library_sync(self, models):
+        library, installed = model_library_read(), [m["name"] for m in models]
         if set(installed) - set(library):
             model_library_write(library + installed)
         return [name for name in library if name not in installed]
@@ -609,13 +700,8 @@ class App:
 
     def details(self, name):
         if name not in self.info:
-            try:
-                s = api("/api/show", {"model": name})
-                ctx = next((v for k, v in s.get("model_info", {}).items() if k.endswith(".context_length")), None)
-                num = re.search(r"num_ctx\s+(\d+)", s.get("parameters") or "")
-                self.info[name] = dict(ctx=ctx, num_ctx=num and int(num.group(1)), caps=s.get("capabilities", []))
-            except OSError:
-                self.info[name] = {}
+            self.info[name] = {}
+            threading.Thread(target=lambda: self.info.__setitem__(name, model_details(name)), daemon=True).start()
         return self.info[name]
 
     def load_library(self):
@@ -722,12 +808,65 @@ class App:
         ]
 
     def chats_rows_collect(self):
-        rows = [dict(label=chat["model"], value=f"{om_chat.chat_title(chat)} · {len(chat['messages'])} messages · "
+        children = {"cc": self.chat_rows_cc(), "nvim": self.chat_rows_nvim(), "chats": self.chat_rows_ollama()}
+        rows = []
+        for folder, about in CHAT_FOLDERS:
+            is_open = self.chat_folders_open.get(folder, True)
+            rows.append(dict(label=f"{'▾' if is_open else '▸'} {folder}", value=f"{len(children[folder])} · {about}", folder=folder,
+                             note="⏎ opens or closes the folder",
+                             action=lambda folder=folder: self.chat_folder_toggle(folder)))
+            if is_open:
+                rows += [dict(child, label=f"    {child['label']}", parent=folder) for child in children[folder]] or [
+                    dict(label="    (empty)", value=self.chat_folder_empty_hint(folder), parent=folder)]
+        return rows
+
+    def chat_folder_empty_hint(self, folder):
+        return {"cc": "start Claude Code from 1 1 llms (c, or :claude)", "nvim": "chat in nvim with <leader>ac; saved chats show here",
+                "chats": "press o on a model in 1 1 llms"}[folder]
+
+    def chat_folder_toggle(self, folder, is_open=None):
+        self.chat_folders_open[folder] = not self.chat_folders_open.get(folder, True) if is_open is None else is_open
+        self.page_rows.pop("chats", None)
+
+    def chat_rows_ollama(self):
+        return [dict(label=chat["model"], value=f"{om_chat.chat_title(chat)} · {len(chat['messages'])} messages · "
                                                 f"{when(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())}",
                      note=f"Saved in {home_short(path)}", path=path, action=lambda path=path, chat=chat: self.chat_open(chat["model"], path),
                      delete=lambda path=path: path.unlink(missing_ok=True))
                 for path, chat in om_chat.chat_list(CHATS)]
-        return rows or [dict(label="no chats yet", value="press o on a model in 1 1 llms to start one")]
+
+    def chat_rows_cc(self):
+        return [dict(label=session["model"], value=f"{session['title']} · {session['messages']} messages · "
+                                                   f"{when(datetime.fromtimestamp(session['updated'], timezone.utc).isoformat())}",
+                     note=f"in {home_short(session['cwd'])} · ⏎ resumes it with {session['model']}; deleting only removes it from om",
+                     path=session["transcript"], action=lambda session=session: self.claude_run(session["cwd"], session["model"], session["session"]),
+                     delete=lambda path=session["path"]: path.unlink(missing_ok=True))
+                for session in om_chat.cc_sessions(CC_SESSIONS, CLAUDE_PROJECTS)]
+
+    def chat_rows_nvim(self):
+        return [dict(label=chat.get("model") or "nvim", value=f"{chat.get('title') or 'untitled'} · {chat.get('message_count', 0)} messages · "
+                                                          f"{when(datetime.fromtimestamp(chat.get('updated_at') or 0, timezone.utc).isoformat())}",
+                     note=f"in {home_short(chat.get('cwd') or '~')} · ⏎ opens it in nvim; delete it from nvim's history picker",
+                     action=lambda chat=chat: self.nvim_chat_open(chat))
+                for chat in om_chat.nvim_chats(NVIM_HISTORY)]
+
+    def nvim_chat_open(self, chat):
+        pick = (f"lua require('codecompanion').extensions.history.browse_chats("
+                f"function(chat) return chat.save_id == {json.dumps(chat['save_id'])} end)")
+        self.terminal_run(["nvim", "-c", pick], cwd=chat.get("cwd") if chat.get("cwd") and os.path.isdir(chat["cwd"]) else None)
+
+    def claude_run(self, folder, model, session=None):
+        resume = session and om_chat.cc_transcript(CLAUDE_PROJECTS, session)
+        session = session or str(uuid.uuid4())
+        if not resume:
+            om_chat.cc_record_write(CC_SESSIONS, session, folder, model)
+        if not shutil.which("claude"):
+            self.msg = ("om claude needs Claude Code's `claude` command on your PATH", C["err"])
+            return None
+        self.terminal_run(["claude", "--resume" if resume else "--session-id", session], cwd=folder, env=claude_env(model))
+        self.page_rows.pop("chats", None)
+        self.msg = (f"back from Claude Code; the session is in 2 4 chats › cc", C["ok"])
+        return None
 
     def backups_rows_collect(self):
         folder = backup_folder()
@@ -783,12 +922,24 @@ class App:
         modelfile_rebuild()
         return "all models updated" + (f", skipped {', '.join(skipped)}" if skipped else "")
 
-    def toggle(self, name):
-        if name in self.loaded:
-            api("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
-            return f"unloaded {name}"
-        api("/api/generate", {"model": name}, timeout=600)
-        return f"loaded {name}"
+    def load_toggle(self, name):
+        if name in self.loading:
+            self.msg = (f"{name} is already {self.loading[name]}", C["warn"])
+            return
+        action = "unloading" if name in self.loaded else "loading"
+        self.loading[name] = action
+        self.msg = (f"{action} {name} in the background", C["dim"])
+        threading.Thread(target=self.load_work, args=(name, action), daemon=True).start()
+
+    def load_work(self, name, action):
+        try:
+            api("/api/generate", {"model": name, **({"keep_alive": 0} if action == "unloading" else {})}, timeout=None)
+            self.msg = (f"{'unloaded' if action == 'unloading' else 'loaded'} {name}", C["ok"])
+        except Exception as e:
+            self.msg = (f"{action} {name} failed: {err_text(e)}", C["err"])
+        finally:
+            self.loading.pop(name, None)
+            self.last = 0
 
     def downloads_collect(self):
         self.downloads = {}
@@ -831,13 +982,13 @@ class App:
         return f"forgot {name}"
 
     # ---- terminal handover -------------------------------------------------
-    def terminal_run(self, command):
+    def terminal_run(self, command, cwd=None, env=None):
         curses.endwin()  # this also leaves the alternate screen; go straight back to it, cleared
         os.write(1, (curses.tigetstr("smcup") or b"") + (curses.tigetstr("clear") or b""))
         # ctrl+c in the command (e.g. stopping ollama's reply) mustn't also quit om; exec resets the handler for the child
         old = signal.signal(signal.SIGINT, lambda *_: None)
         try:
-            return subprocess.run(command).returncode
+            return subprocess.run(command, cwd=cwd, env=env).returncode
         finally:
             signal.signal(signal.SIGINT, old)
             self.scr.clear()
@@ -887,10 +1038,11 @@ class App:
         s.erase()
         h, w = s.getmaxyx()
         self.put(0, 0, " " * w, C["bar"])
-        self.put(0, 1, " om ", C["sel"] | curses.A_BOLD)
+        logo = f" :{self.palette}▌ " if self.palette is not None else f" {self.pending or 'om'} "
+        self.put(0, 1, logo, C["sel"] | curses.A_BOLD)
         group, pending = page_group(self.page), chord_pending(self.chord, time.time())
         blink_off = pending and int(time.time() * BLINKS_PER_SECOND) % 2
-        x = self.draw_tabs(0, 6, [name for name, _ in GROUPS], -1 if blink_off else group, C["bar"])
+        x = self.draw_tabs(0, len(logo) + 2, [name for name, _ in GROUPS], -1 if blink_off else group, C["bar"])
         pages = GROUPS[group][1]
         hint_x = self.draw_tabs(1, 2, [name for name, _ in pages], [page for _, page in pages].index(self.page), C["dim"])
         if pending:
@@ -905,7 +1057,19 @@ class App:
             for k, label, x in row:
                 self.put(y, x, k, C["accent"] | curses.A_BOLD)
                 self.put(y, x + len(k) + 1, label, C["dim"])
+        if self.palette is not None:
+            self.draw_palette(w)
         s.refresh()
+
+    def draw_palette(self, w):
+        matches = command_matches(self.commands(), palette_parse(self.palette)[0])[:PALETTE_ROWS]
+        self.palette_sel = max(0, min(self.palette_sel, len(matches) - 1))
+        name_width = max([len(f"{c['name']} {c.get('usage', '')}") for c in matches] + [0]) + 2
+        width = min(w - 2, max([name_width + len(f"{c['group']} · {c['help']}") for c in matches] + [30]) + 2)
+        lines = [(f" {c['name']} {c.get('usage', '')}".ljust(name_width + 1) + f"{c['group']} · {c['help']}")[:width].ljust(width)
+                 for c in matches] or [" no command matches; esc cancels".ljust(width)]
+        for i, line in enumerate(lines):
+            self.put(2 + i, 1, line, C["sel"] if i == self.palette_sel and matches else C["bar"])
 
     def draw_tabs(self, y, x, names, current, attr):
         for i, name in enumerate(names, 1):
@@ -916,7 +1080,8 @@ class App:
 
     def footer_rows(self, w):
         rows, x = [[]], 1
-        for k, label in FOOTER[self.page]:
+        scheme = FOOTER_PALETTE if self.palette is not None else FOOTER_VIM if self.controls() == "vim" else FOOTER[self.page]
+        for k, label in scheme:
             width = len(k) + len(label) + 4
             if x + width - 3 > w and rows[-1]:
                 rows.append([])
@@ -928,10 +1093,11 @@ class App:
     def draw_models(self, h, w):
         mem = sum(m.get("size_vram", 0) for m in self.loaded.values())
         saved = len(self.entries) - len(self.models)
-        right = f"{size_text(mem)} in memory · {size_text(sum(m['size'] for m in self.models))} on disk · {saved} saved "
+        right = (("ollama is busy, still answering slowly · " if self.ollama_busy else "") +
+                 f"{size_text(mem)} in memory · {size_text(sum(m['size'] for m in self.models))} on disk · {saved} saved ")
         if self.down:
             self.put(2, 2, "Ollama isn't running.", C["err"] | curses.A_BOLD)
-            self.put(3, 2, "Press S to start it with your settings.", C["dim"])
+            self.put(3, 2, f"{'Type :start' if self.controls() == 'vim' else 'Press S'} to start it with your settings.", C["dim"])
             return right
         b, nv = base(), nvim_model()
         nw = max([len(m["name"]) for m in self.entries] + [10]) + 2
@@ -945,7 +1111,11 @@ class App:
                      (when(m["modified_at"]), C["dim"]) if have else ("not installed", C["dim"])]
             if name in self.downloads:
                 cells[4] = self.download_cell(self.downloads[name])
-            rows.append(("●" if on else "○" if have else "◌", C["ok"] if on else C["dim"], cells,
+            if name in self.loading:
+                cells[4] = (f"{self.loading[name]}…", C["warn"])
+            spin = SPIN[int(time.time() * 10) % len(SPIN)]
+            rows.append((spin if name in self.loading else "●" if on else "○" if have else "◌",
+                         C["warn"] if name in self.loading else C["ok"] if on else C["dim"], cells,
                          " ".join(role for role, yes in roles if yes), C["tag"]))
         self.table([("MODEL", nw), ("PARAMS", 9), ("QUANT", 9), ("SIZE", 10), ("MODIFIED", 15)], rows, self.sel["models"])
         if self.entries:
@@ -1052,7 +1222,10 @@ class App:
             facts.append(f"context {info['ctx'] // 1024}K max" + (f", {info['num_ctx'] // 1024}K set" if info.get("num_ctx") else ""))
         self.put(y + 1, 3, " · ".join(f for f in facts if f))
         self.put(y + 2, 3, "can: " + ", ".join(info.get("caps", [])), C["dim"])
-        if name in self.loaded:
+        if name in self.loading:
+            self.put(y + 3, 3, f"{SPIN[int(time.time() * 10) % len(SPIN)]} {self.loading[name]} in the background; "
+                               "everything else keeps working", C["warn"])
+        elif name in self.loaded:
             p = self.loaded[name]
             self.put(y + 3, 3, f"● loaded · {size_text(p.get('size_vram', 0))} in memory · unloads {when(p['expires_at'])}", C["ok"])
         else:
@@ -1170,7 +1343,10 @@ class App:
         return win
 
     def help(self):
-        entries = [(self.page, "")] + HELP[self.page] + [("", ""), ("every page", "")] + HELP["every page"]
+        entries = ([("vim keys", "")] + HELP_VIM + [("", ""), ("commands", "")] +
+                   [(f":{c['name']} {c.get('usage', '')}", f"{c['group']} · {c['help']}") for c in self.commands()]
+                   if self.controls() == "vim" else
+                   [(self.page, "")] + HELP[self.page] + [("", ""), ("every page", "")] + HELP["every page"])
         w = max(len(k) for k, _ in entries) + 3
         win = self.box([k.ljust(w) + d for k, d in entries] + ["", "any key closes"], 40)
         try:
@@ -1280,6 +1456,13 @@ class App:
 
     # ---- keys --------------------------------------------------------------
     def handle(self, k):
+        if self.palette is not None:
+            return self.handle_palette(k)
+        if k == ord(":"):
+            self.palette, self.palette_sel = "", 0
+            return None
+        if self.controls() == "vim":
+            return self.handle_vim(k)
         if k == ord("q"):
             return False
         if k in (ord("h"), ord("?")):
@@ -1289,10 +1472,178 @@ class App:
         page = self.page_for_key(k)
         if page is None:
             return getattr(self, f"handle_{self.page}")(k)
+        self.page_set(page)
+
+    def controls(self):
+        return om_settings_read()["controls"]
+
+    def page_set(self, page):
         self.page = page
         self.group_last[page_group(page)] = page
         if page == "marketplace" and self.lib is None:
             self.load_library()
+
+    def selection_count(self):
+        counts = {"models": lambda: len(self.entries), "marketplace": lambda: len(self.market()),
+                  "ollama": lambda: len(self.settings_options or []), "om": lambda: len(OM_OPTIONS)}
+        return counts.get(self.page, lambda: len(self.rows()))()
+
+    def selection_jump(self, index):
+        self.sel[self.page] = max(0, min(index, self.selection_count() - 1))
+
+    def handle_vim(self, k):
+        if ord("1") <= k <= ord("9") or (k == ord("0") and self.pending[:1].isdigit()):
+            self.pending += chr(k)
+            return None
+        typed = re.match(r"\d*", self.pending).group()
+        count = int(typed or 1)
+        if k == ord("g") and not self.pending.endswith("g"):
+            self.pending += "g"
+            return None
+        jump_to_typed = self.pending.endswith("g") and k == ord("g")
+        self.pending = ""
+        half_page = max(1, (self.body_h - 13) // 2)
+        moves = {ord("j"): count, curses.KEY_DOWN: count, ord("k"): -count, curses.KEY_UP: -count,
+                 CTRL_D: half_page * count, CTRL_U: -half_page * count}
+        pages = {ord("h"): -count, curses.KEY_LEFT: -count, ord("l"): count, curses.KEY_RIGHT: count}
+        if jump_to_typed:
+            return self.selection_jump(int(typed) - 1 if typed else 0)
+        if k == ord("G"):
+            return self.selection_jump(int(typed) - 1 if typed else self.selection_count() - 1)
+        if k in moves:
+            return self.selection_jump(self.sel[self.page] + moves[k])
+        if k in pages:
+            return self.page_set(PAGES[(PAGES.index(self.page) + pages[k]) % len(PAGES)])
+        if k == ord("?"):
+            return self.help()
+        if k == ord("z"):
+            return self.screensaver()
+        if k in VIM_PASSTHROUGH:
+            return getattr(self, f"handle_{self.page}")(k)
+        if k != 27:
+            self.msg = (f"{curses.keyname(k).decode(errors='replace')} isn't a vim key here; : lists every command", C["dim"])
+        return None
+
+    def handle_palette(self, k):
+        typed = self.palette
+        query, arg = palette_parse(typed)
+        matches = command_matches(self.commands(), query)
+        if k == 27 or (k in (127, 8, curses.KEY_BACKSPACE) and not typed):
+            self.palette = None
+        elif k in (127, 8, curses.KEY_BACKSPACE):
+            self.palette, self.palette_sel = typed[:-1], 0
+        elif k == curses.KEY_DOWN:
+            self.palette_sel = min(self.palette_sel + 1, len(matches) - 1)
+        elif k == curses.KEY_UP:
+            self.palette_sel = max(self.palette_sel - 1, 0)
+        elif k == 9 and matches:
+            self.palette = f"{matches[self.palette_sel]['name']} {arg}"
+        elif k in ENTER:
+            self.palette = None
+            return self.command_run(typed, matches[self.palette_sel] if matches else None)
+        elif 32 <= k < 127:
+            self.palette, self.palette_sel = typed + chr(k), 0
+        return None
+
+    def command_run(self, typed, command):
+        jump = re.fullmatch(r"\s*([1-9])\s*([1-9])?\s*", typed)
+        if jump:
+            group = GROUPS[min(int(jump.group(1)), len(GROUPS)) - 1][1]
+            return self.page_set(group[min(int(jump.group(2) or 1), len(group)) - 1][1])
+        if command is None:
+            self.msg = (f"no command matches :{typed}", C["err"])
+            return None
+        return command["run"](palette_parse(typed)[1])
+
+    def command_key(self, page, key):
+        self.page_set(page)
+        return getattr(self, f"handle_{page}")(ENTER[0] if key == "\n" else ord(key))
+
+    def ollama_start(self):
+        pid = ollama_service_pid()
+        if pid:
+            self.msg = (f"ollama is already running (pid {pid}); if it's slow, it's busy loading a model", C["warn"])
+            return
+        self.run("starting ollama", ollama_service_apply)
+
+    def command_on(self, name, pages, letter):
+        if self.page not in pages:
+            self.msg = (f":{name} works on {' and '.join(page_label(page) for page in pages)}; you're on {page_label(self.page)}", C["warn"])
+            return None
+        return getattr(self, f"handle_{self.page}")(ENTER[0] if letter == "\n" else ord(letter))
+
+    def command_claude(self, folder):
+        if not self.entries:
+            self.msg = ("no models listed yet; is ollama running? (:start)", C["err"])
+            return None
+        if not folder:
+            return self.command_on("claude", ["models"], "c")
+        where = os.path.expanduser(folder)
+        if not os.path.isdir(where) or not self.entries:
+            self.msg = (f"not a directory: {folder}" if self.entries else "no model selected", C["err"])
+            return None
+        return where, self.entries[self.sel["models"]]["name"]
+
+    def command_search(self, text):
+        if not text:
+            return self.command_key("marketplace", "/")
+        self.page_set("marketplace")
+        self.query, self.sel["marketplace"] = text, 0
+        return None
+
+    def command_controls(self, scheme):
+        settings = om_settings_read()
+        current = settings["controls"]
+        settings["controls"] = scheme if scheme in CONTROL_SCHEMES else \
+            CONTROL_SCHEMES[(CONTROL_SCHEMES.index(current) + 1) % len(CONTROL_SCHEMES)]
+        om_settings_write(settings)
+        self.msg = (f"controls: {settings['controls']}", C["ok"])
+
+    def commands(self):
+        go = lambda page: lambda arg: self.page_set(page)
+        key = lambda page, letter: lambda arg: self.command_key(page, letter)
+        here = lambda letter: lambda arg: getattr(self, f"handle_{self.page}")(ord(letter))
+        with_arg = lambda when_given, otherwise: lambda arg: when_given(arg) if arg else otherwise(arg)
+        on = lambda name, pages, letter: lambda arg: self.command_on(name, pages, letter)
+        return [
+            dict(name="llms", group="ollama", help="your installed and saved models", run=go("models")),
+            dict(name="market", group="ollama", help="ollama.com's model library", run=go("marketplace")),
+            dict(name="server", group="ollama", help="ollama's server settings", run=go("ollama")),
+            dict(name="pull", group="ollama", usage="[model]", help="download a model in the background",
+                 run=with_arg(lambda arg: self.pull_checked(tagged(arg), None), key("models", "p"))),
+            dict(name="save", group="ollama", usage="[model]", help="add a model to your library without downloading it",
+                 run=with_arg(lambda arg: self.run(f"checking {arg}", lambda: self.model_library_add(arg)), key("models", "a"))),
+            dict(name="load", group="ollama", help="load or unload the selected model", run=on("load", ["models"], "\n")),
+            dict(name="chat", group="ollama", help="chat with the selected model", run=on("chat", ["models"], "o")),
+            dict(name="pause", group="ollama", help="pause or resume the selected model's download", run=on("pause", ["models"], "x")),
+            dict(name="update", group="ollama", help="update the selected model", run=on("update", ["models"], "u")),
+            dict(name="update-all", group="ollama", help="update every model, then rebuild cc-longwork", run=key("models", "U")),
+            dict(name="delete", group="ollama", help="delete the selected model (it stays in your library) or chat",
+                 run=on("delete", ["models", "chats"], "d")),
+            dict(name="nvim", group="ollama", usage="[model]", help="the model nvim's codecompanion uses",
+                 run=with_arg(lambda arg: self.run(f"setting the nvim model to {arg}", lambda: nvim_model_set(arg)), on("nvim", ["models"], "n"))),
+            dict(name="claude", group="ollama", usage="[dir]", help="Claude Code on the selected model", run=self.command_claude),
+            dict(name="base", group="ollama", help="rebuild cc-longwork on the selected model", run=on("base", ["models"], "b")),
+            dict(name="search", group="ollama", usage="[text]", help="search the market", run=self.command_search),
+            dict(name="sort", group="ollama", help="change the market's order", run=key("marketplace", "s")),
+            dict(name="tools", group="ollama", help="only models that can use tools", run=key("marketplace", "t")),
+            dict(name="apply", group="ollama", help="restart ollama with the server settings", run=key("ollama", "a")),
+            dict(name="start", group="ollama", help="start the ollama service", run=lambda arg: self.ollama_start()),
+            dict(name="configs", group="local", help="nvim model, claude base and context, backup folder", run=go("configs")),
+            dict(name="files", group="local", help="om's files, the models folder, the log", run=go("files")),
+            dict(name="system", group="local", help="chip, memory, GPU limit, ollama", run=go("system")),
+            dict(name="chats", group="local", help="saved ollama-local chats", run=go("chats")),
+            dict(name="backups", group="local", help="claude-local and ollama-local backups", run=go("backups")),
+            dict(name="backup", group="local", help="back up everything now",
+                 run=lambda arg: self.run("backing up everything", lambda: ", ".join(home_short(p) for p in backup_everything()))),
+            dict(name="finder", group="local", help="show the selected file in Finder", run=here("f")),
+            dict(name="refresh", group="local", help="reload the current page", run=here("r")),
+            dict(name="settings", group="om", help="om's look and controls", run=go("om")),
+            dict(name="controls", group="om", usage="[classic|vim]", help="switch the control scheme", run=self.command_controls),
+            dict(name="screensaver", group="om", help="watch the downloads", run=lambda arg: self.screensaver()),
+            dict(name="help", group="om", help="every key and command", run=lambda arg: self.help()),
+            dict(name="q", group="om", help="quit om (downloads keep going)", run=lambda arg: False),
+        ]
 
     def page_for_key(self, k):
         i = PAGES.index(self.page)
@@ -1317,7 +1668,7 @@ class App:
             self.last = 0
             self.info.clear()
         elif k == ord("S"):
-            self.run("starting ollama", ollama_service_apply)
+            self.ollama_start()
         elif k == ord("p"):
             name = self.ask("Pull which model? (e.g. qwen3-coder-next)")
             if name:
@@ -1351,7 +1702,7 @@ class App:
 
     def handle_installed(self, k, name):
         if k in (*ENTER, ord(" ")):
-            self.run(("unloading " if name in self.loaded else "loading ") + name, lambda: self.toggle(name))
+            self.load_toggle(name)
         elif k == ord("u"):
             self.pull_checked(name, None)
         elif k == ord("o"):
@@ -1372,7 +1723,7 @@ class App:
                 self.run(f"rebuilding {CUSTOM} on {name}", lambda: modelfile_base_set(name))
         elif k == ord("d"):
             warn = " om claude uses it!" if is_custom(name) else ""
-            if self.confirm(f"Delete {name} ({size_text(self.entries[self.sel['models']]['size'])})?{warn}"):
+            if self.confirm(f"Delete the model {name} from disk ({size_text(self.entries[self.sel['models']]['size'])})?{warn}"):
                 self.run(f"deleting {name}", lambda: self.delete(name))
 
     def handle_marketplace(self, k):
@@ -1514,7 +1865,7 @@ class App:
             self.run(f"rebuilding {CUSTOM} on {name}", lambda: modelfile_base_set(name))
 
     def config_context_edit(self):
-        limit = self.details(base() or "").get("ctx")
+        limit = model_details(base() or "").get("ctx")
         answer = self.ask(f"Context size in tokens for {CUSTOM}" + (f" (the model allows up to {limit:,})" if limit else "") + ":",
                           modelfile_field(MODELFILE_CONTEXT) or "")
         if not answer:
@@ -1546,11 +1897,13 @@ def main(scr):
     app = App(scr)
     while True:
         if time.time() - app.last > 2:
-            app.refresh()
+            app.refresh_start()
         app.draw()
         k = scr.getch()
         r = app.handle(k) if k != -1 else None
-        if r is False or isinstance(r, tuple):
+        if isinstance(r, tuple):
+            app.claude_run(*r)
+        elif r is False:
             return r
 
 
@@ -1570,14 +1923,21 @@ om apply                   restart ollama with om's server settings (brew on mac
 om upgrade                 brew upgrade ollama, then apply"""
 
 
+def claude_env(model):
+    return {**os.environ, "ANTHROPIC_BASE_URL": API, "ANTHROPIC_AUTH_TOKEN": CLAUDE_TOKEN, "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", **{f"ANTHROPIC_DEFAULT_{tier}_MODEL": model for tier in CLAUDE_TIERS}}
+
+
 def claude_exec(model, folder=None, args=()):
     if not shutil.which("claude"):
         raise RuntimeError("om claude needs Claude Code's `claude` command on your PATH")
     if folder:
         os.chdir(folder)
-    env = {**os.environ, "ANTHROPIC_BASE_URL": API, "ANTHROPIC_AUTH_TOKEN": CLAUDE_TOKEN, "ANTHROPIC_API_KEY": "",
-           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", **{f"ANTHROPIC_DEFAULT_{tier}_MODEL": model for tier in CLAUDE_TIERS}}
-    os.execvpe("claude", ["claude", *args], env)
+    if not set(args) & CLAUDE_SESSION_FLAGS:
+        session = str(uuid.uuid4())
+        om_chat.cc_record_write(CC_SESSIONS, session, os.getcwd(), model)
+        args = ["--session-id", session, *args]
+    os.execvpe("claude", ["claude", *args], claude_env(model))
 
 
 def ask_yes(question):
@@ -1653,15 +2013,12 @@ def tui():
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
     try:
-        launch = curses.wrapper(main)
+        curses.wrapper(main)
     except KeyboardInterrupt:
-        launch = None
+        pass
     running = [d["name"] for d in download_states() if d["state"] == "downloading"]
     if running:
         print(f"still downloading in the background: {', '.join(running)}. Run om to watch or pause them.")
-    if launch:
-        where, model = launch
-        claude_exec(model, where)
 
 
 def cli(argv=None):

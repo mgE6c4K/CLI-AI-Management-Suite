@@ -32,6 +32,51 @@ def chat_latest(folder, model):
     return next((path for path, chat in chat_list(folder) if chat["model"] == model), None)
 
 
+def cc_record_write(folder, session, cwd, model):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{session}.json").write_text(json.dumps(dict(session=session, cwd=str(cwd), model=model, started=time.time())))
+
+
+def cc_transcript(projects, session):
+    return next(iter(projects.glob(f"*/{session}.jsonl")), None)
+
+
+def cc_summary(transcript):
+    title, first, messages = None, None, 0
+    for line in transcript.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        kind = entry.get("type")
+        if kind == "custom-title":
+            title = entry.get("customTitle") or title
+        elif kind in ("user", "assistant") and not entry.get("isMeta"):
+            content = entry.get("message", {}).get("content")
+            text = content if isinstance(content, str) else " ".join(
+                block.get("text", "") for block in content or [] if isinstance(block, dict) and block.get("type") == "text")
+            messages += bool(text.strip())
+            first = first or (text.strip() if kind == "user" else None)
+    return dict(title=" ".join((title or first or "empty session").split()), messages=messages)
+
+
+def cc_sessions(folder, projects):
+    sessions = []
+    for path in folder.glob("*.json"):
+        record = chat_read(path)
+        if record.get("session"):
+            transcript = cc_transcript(projects, record["session"])
+            summary = cc_summary(transcript) if transcript else dict(title="no messages yet", messages=0)
+            sessions.append(dict(record, **summary, path=path, transcript=transcript,
+                                 updated=transcript.stat().st_mtime if transcript else record.get("started", 0)))
+    return sorted(sessions, key=lambda s: s["updated"], reverse=True)
+
+
+def nvim_chats(index_path):
+    index = chat_read(index_path)
+    return sorted(index.values(), key=lambda chat: chat.get("updated_at") or 0, reverse=True) if isinstance(index, dict) else []
+
+
 def chat_title(chat):
     first = next((m["content"] for m in chat.get("messages", []) if m["role"] == "user"), "")
     return " ".join(first.split()) or "empty chat"

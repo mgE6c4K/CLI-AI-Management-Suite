@@ -12,7 +12,8 @@ with tempfile.TemporaryDirectory() as folder:
     assert om.MODEL_LIBRARY.read_text() == "qwen3-coder:latest\ngemma3:4b\na:b\n"
 
     om.OM_SETTINGS = Path(folder, "om.json")
-    assert om.om_settings_read() == {"screensaver": "warp", "progress style": "blocks", "walker": "llama", "accent colour": "cyan", "backup folder": "~/Documents"}
+    assert om.om_settings_read() == {"controls": "classic", "screensaver": "warp", "progress style": "blocks", "walker": "llama",
+                                 "accent colour": "cyan", "backup folder": "~/Documents"}
     om.OM_SETTINGS.write_text('{"screensaver": "rain", "accent colour": "plaid", "gone": 1}')
     assert om.om_settings_read()["screensaver"] == "rain" and om.om_settings_read()["accent colour"] == "cyan"
 
@@ -42,6 +43,19 @@ assert om.page_jump(last, None, 5, 10.0, "models") == (None, None)
 assert om.page_jump(last, (1, 10.0, "models"), -1, 10.5, "configs") == ("models", None)
 assert om.page_jump(last, (1, 10.0, "models"), -1, 12.0, "configs") == (None, None)
 assert [om.page_group(p) for p in ("models", "marketplace", "files", "om")] == [0, 0, 1, 2]
+assert om.fuzzy_score("pl", "pull") == 1 and om.fuzzy_score("lp", "pull") is None and om.fuzzy_score("", "x") == 0
+commands = [dict(name="pull", group="ollama"), dict(name="backup", group="local"), dict(name="backups", group="local"),
+            dict(name="pause", group="ollama")]
+assert [c["name"] for c in om.command_matches(commands, "pu")] == ["pull", "pause"]
+assert [c["name"] for c in om.command_matches(commands, "back")] == ["backup", "backups"]
+assert [c["name"] for c in om.command_matches(commands, "local ba")] == ["backup", "backups"]
+assert om.command_matches(commands, "zzz") == []
+assert om.palette_parse("pull qwen3") == ("pull", "qwen3") and om.palette_parse("local sys") == ("local sys", "")
+assert om.palette_parse("ollama pull qwen3 x") == ("ollama pull", "qwen3 x") and om.palette_parse("local") == ("local", "")
+import socket, urllib.error
+assert om.ollama_timed_out(TimeoutError()) and om.ollama_timed_out(urllib.error.URLError(socket.timeout("timed out")))
+assert not om.ollama_timed_out(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")))
+assert om.page_label("chats") == "2 4 chats" and om.page_label("models") == "1 1 llms" and om.page_label("om") == "3 1 settings"
 print("pages ok")
 
 import om_backups, zipfile
