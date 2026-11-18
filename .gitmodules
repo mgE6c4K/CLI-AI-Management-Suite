@@ -1,0 +1,3 @@
+[submodule "claude-backup"]
+	path = claude-backup
+	url = ../claude-backup
